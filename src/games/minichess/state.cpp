@@ -194,6 +194,120 @@ bool State::is_defended(int defend_r, int defend_c, int player) const {
     return false;
 }
 
+int State::count_attackers_on_square(int target_r, int target_c, int attacker_player) const {
+    int count = 0;
+    auto attacker_board = this->board.board[attacker_player];
+    for(int r = 0; r < BOARD_H; r++){
+        for(int c = 0; c < BOARD_W; c++){
+            int piece = attacker_board[r][c];
+            if(piece > 0 && piece <= 6){
+                if(attacks_square(r, c, attacker_player, target_r, target_c)){
+                    count++;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+int State::count_defenders_on_square(int target_r, int target_c, int defender_player) const {
+    return count_attackers_on_square(target_r, target_c, defender_player);
+}
+
+bool State::attacks_square(int r, int c, int player, int target_r, int target_c) const {
+    if(r == target_r && c == target_c) return false;
+    auto self_board = this->board.board[player];
+    auto opp_board = this->board.board[1 - player];
+    int piece = self_board[r][c];
+    if(piece <= 0 || piece > 6) return false;
+
+    int dr = target_r - r;
+    int dc = target_c - c;
+    int adr = std::abs(dr);
+    int adc = std::abs(dc);
+
+    if(piece == 1){
+        if(player == 0){
+            return dr == -1 && adc == 1;
+        }
+        return dr == 1 && adc == 1;
+    }
+    if(piece == 3){
+        return (adr == 2 && adc == 1) || (adr == 1 && adc == 2);
+    }
+    if(piece == 6){
+        return std::max(adr, adc) == 1;
+    }
+    int drs[8] = {0, 0, 1, -1, 1, 1, -1, -1};
+    int dcs[8] = {1, -1, 0, 0, 1, -1, 1, -1};
+    int start = (piece == 4) ? 4 : 0;
+    int end = (piece == 2) ? 4 : 8;
+    for(int d = start; d < end; d++){
+        int step_r = drs[d];
+        int step_c = dcs[d];
+        if(step_r == 0 && step_c == 0) continue;
+        int nr = r + step_r;
+        int nc = c + step_c;
+        while(nr >= 0 && nr < BOARD_H && nc >= 0 && nc < BOARD_W){
+            if(nr == target_r && nc == target_c) return true;
+            if(self_board[nr][nc] > 0 || opp_board[nr][nc] > 0) break;
+            nr += step_r;
+            nc += step_c;
+        }
+    }
+    return false;
+}
+
+bool State::is_pinned_piece(int piece_r, int piece_c, int target_player) const {
+    int piece = this->board.board[target_player][piece_r][piece_c];
+    if(piece <= 0 || piece == 6) return false;
+    int king_r = -1, king_c = -1;
+    for(int r = 0; r < BOARD_H; r++){
+        for(int c = 0; c < BOARD_W; c++){
+            if(this->board.board[target_player][r][c] == 6){
+                king_r = r;
+                king_c = c;
+                break;
+            }
+        }
+        if(king_r != -1) break;
+    }
+    if(king_r == -1) return false;
+
+    int dr = piece_r - king_r;
+    int dc = piece_c - king_c;
+    if(dr == 0 && dc == 0) return false;
+    int step_r = (dr > 0) ? 1 : ((dr < 0) ? -1 : 0);
+    int step_c = (dc > 0) ? 1 : ((dc < 0) ? -1 : 0);
+    if(step_r != 0 && step_c != 0 && std::abs(dr) != std::abs(dc)) return false;
+    if(step_r == 0 && step_c == 0) return false;
+
+    int nr = king_r + step_r;
+    int nc = king_c + step_c;
+    bool seen_target = false;
+    while(nr >= 0 && nr < BOARD_H && nc >= 0 && nc < BOARD_W){
+        int occupant = this->board.board[target_player][nr][nc] ? this->board.board[target_player][nr][nc] : this->board.board[1 - target_player][nr][nc];
+        if(nr == piece_r && nc == piece_c){
+            if(occupant != piece) return false;
+            seen_target = true;
+            nr += step_r;
+            nc += step_c;
+            continue;
+        }
+        if(occupant > 0){
+            if(!seen_target) return false;
+            int attacker = this->board.board[1 - target_player][nr][nc];
+            if(attacker == 2 && step_r * step_c == 0) return true;
+            if(attacker == 4 && step_r != 0 && step_c != 0) return true;
+            if(attacker == 5) return true;
+            return false;
+        }
+        nr += step_r;
+        nc += step_c;
+    }
+    return false;
+}
+
 
 /*============================================================
  * evaluate() — runtime-selectable eval strategy
@@ -367,7 +481,40 @@ int State::evaluate(
         }
     }
 
-    bonus += self_fork_bonus - oppn_fork_penalty;
+    // Check for pinned enemy pieces and pressure value
+    int pin_pressure_bonus = 0;
+    for(int r = 0; r < BOARD_H; r++){
+        for(int c = 0; c < BOARD_W; c++){
+            int piece = oppn_board[r][c];
+            if(piece > 0 && piece != 6 && const_cast<State*>(this)->is_pinned_piece(r, c, 1 - this->player)){
+                int attackers = const_cast<State*>(this)->count_attackers_on_square(r, c, this->player);
+                int defenders = const_cast<State*>(this)->count_defenders_on_square(r, c, 1 - this->player);
+                int pressure = 5;
+
+                if(attackers > defenders + 1){
+                    pressure += 15 + (attackers - defenders - 1) * 5;
+                } else if(attackers > defenders){
+                    pressure += 10;
+                } else if(attackers == defenders){
+                    pressure += 5;
+                }
+
+                if(!const_cast<State*>(this)->is_defended(r, c, 1 - this->player)){
+                    pressure += 5;
+                }
+
+                // If our attacking force is significantly stronger than the defenders,
+                // reward this pin as a likely safe target rather than poison.
+                if(attackers >= defenders + 2){
+                    pressure += 10;
+                }
+
+                pin_pressure_bonus += pressure;
+            }
+        }
+    }
+
+    bonus += self_fork_bonus - oppn_fork_penalty + pin_pressure_bonus;
 
     return self_score - oppn_score + bonus;
 }

@@ -80,7 +80,11 @@ public:
     int board_w() const override { return BOARD_W; }
     const char* game_name() const override { return "MiniChess"; }
 
-    /* === Fork Detection Helpers === */
+    /* === Tactical Helpers === */
     int count_attacked_pieces(int attacker_r, int attacker_c, int player) const;
     bool is_defended(int defend_r, int defend_c, int player) const;
+    int count_attackers_on_square(int target_r, int target_c, int attacker_player) const;
+    int count_defenders_on_square(int target_r, int target_c, int defender_player) const;
+    bool attacks_square(int r, int c, int player, int target_r, int target_c) const;
+    bool is_pinned_piece(int piece_r, int piece_c, int target_player) const;
 };
