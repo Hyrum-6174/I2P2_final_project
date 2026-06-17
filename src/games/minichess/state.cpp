@@ -57,6 +57,33 @@ static int king_tropism(
     return 0;
 }
 
+static bool king_tropism_applicable(
+    const State* state,
+    int piece_type,
+    int pr, int pc,
+    int player
+){
+    if(piece_type <= 0 || piece_type > 6) return false;
+
+    int enemy = 1 - player;
+    int attackers = state->count_attackers_on_square(pr, pc, enemy);
+    if(attackers == 0){
+        return true;
+    }
+
+    int defenders = state->count_defenders_on_square(pr, pc, player);
+    if(defenders >= attackers){
+        return true;
+    }
+
+    // Allow tropism if the piece is already attacking enemy material.
+    if(state->count_attacked_pieces(pr, pc, player) > 0){
+        return true;
+    }
+
+    return false;
+}
+
 
 /*============================================================
  * Fork Detection Helpers
@@ -214,6 +241,70 @@ int State::count_defenders_on_square(int target_r, int target_c, int defender_pl
     return count_attackers_on_square(target_r, target_c, defender_player);
 }
 
+int State::space_score(int player) const {
+    State temp(this->board, player);
+    temp.get_legal_actions();
+    return temp.legal_actions.size();
+}
+
+int State::pawn_structure_score(int pr, int pc, int player) const {
+    if(this->board.board[player][pr][pc] != 1) return 0;
+
+    int score = 0;
+    int back_r = (player == 0) ? pr + 1 : pr - 1;
+    if(back_r >= 0 && back_r < BOARD_H){
+        if(pc > 0 && this->board.board[player][back_r][pc - 1] == 1){
+            score += 4;
+        }
+        if(pc < BOARD_W - 1 && this->board.board[player][back_r][pc + 1] == 1){
+            score += 4;
+        }
+    }
+
+    int forward_r = (player == 0) ? pr - 1 : pr + 1;
+    if(forward_r >= 0 && forward_r < BOARD_H){
+        for(int dc = -1; dc <= 1; dc += 2){
+            int nc = pc + dc;
+            if(nc < 0 || nc >= BOARD_W) continue;
+            if(this->board.board[1 - player][forward_r][nc] > 0){
+                score += 3;
+            } else {
+                score += 1;
+            }
+        }
+    }
+
+    return score;
+}
+
+int State::king_threat_score(int king_r, int king_c, int owner, int attacker) const {
+    if(king_r < 0 || king_c < 0) return 0;
+    int score = 0;
+    int king_attackers = count_attackers_on_square(king_r, king_c, attacker);
+    if(king_attackers > 0){
+        score += 30 + king_attackers * 10;
+    }
+
+    for(int dr = -2; dr <= 2; dr++){
+        for(int dc = -2; dc <= 2; dc++){
+            if(dr == 0 && dc == 0) continue;
+            int r = king_r + dr;
+            int c = king_c + dc;
+            if(r < 0 || r >= BOARD_H || c < 0 || c >= BOARD_W) continue;
+            int piece = this->board.board[owner][r][c];
+            if(piece <= 0 || piece == 6) continue;
+            int attackers = count_attackers_on_square(r, c, attacker);
+            if(attackers == 0) continue;
+            if(!is_defended(r, c, owner)){
+                score += kp_material[piece] + 8;
+            } else {
+                score += 4;
+            }
+        }
+    }
+    return score;
+}
+
 bool State::attacks_square(int r, int c, int player, int target_r, int target_c) const {
     if(r == target_r && c == target_c) return false;
     auto self_board = this->board.board[player];
@@ -256,6 +347,74 @@ bool State::attacks_square(int r, int c, int player, int target_r, int target_c)
         }
     }
     return false;
+}
+
+int State::move_order_score(const Move& action, const State* next) const {
+    int score = 0;
+    int from_r = action.first.first;
+    int from_c = action.first.second;
+    int enemy = 1 - this->player;
+    bool from_attacked = this->count_attackers_on_square(from_r, from_c, enemy) > 0;
+    if(!from_attacked){
+        return 0;
+    }
+
+    int dest_r = action.second.first;
+    int dest_c = action.second.second;
+    int captured = this->board.board[enemy][dest_r][dest_c];
+    if(captured > 0){
+        score += 8;
+    }
+
+    bool discovered = false;
+    for(int r = 0; r < BOARD_H && !discovered; r++){
+        for(int c = 0; c < BOARD_W && !discovered; c++){
+            if(r == from_r && c == from_c) continue;
+            int piece = this->board.board[this->player][r][c];
+            if(piece <= 0) continue;
+            for(int er = 0; er < BOARD_H && !discovered; er++){
+                for(int ec = 0; ec < BOARD_W; ec++){
+                    int target_piece = next->board.board[enemy][er][ec];
+                    if(target_piece <= 0) continue;
+                    if(next->attacks_square(r, c, this->player, er, ec) &&
+                       !this->attacks_square(r, c, this->player, er, ec)){
+                        discovered = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if(discovered){
+        score += 4;
+    }
+
+    // If the move gives check in the next position, prefer it slightly.
+    int opp = next->player;
+    int king_r = -1, king_c = -1;
+    for(int r = 0; r < BOARD_H; r++){
+        for(int c = 0; c < BOARD_W; c++){
+            if(next->board.board[opp][r][c] == 6){
+                king_r = r;
+                king_c = c;
+                break;
+            }
+        }
+        if(king_r != -1) break;
+    }
+    if(king_r != -1 && next->count_attackers_on_square(king_r, king_c, 1 - opp) > 0){
+        score += 5;
+    }
+
+    // Prefer escaping to a less attacked square if no capture/check/discovery is available.
+    if(score == 0){
+        int future_attackers = next->count_attackers_on_square(dest_r, dest_c, enemy);
+        if(future_attackers == 0){
+            score += 2;
+        }
+    }
+
+    return score;
 }
 
 bool State::is_pinned_piece(int piece_r, int piece_c, int target_player) const {
@@ -330,6 +489,9 @@ int State::evaluate(
     auto self_board = this->board.board[this->player];
     auto oppn_board = this->board.board[1 - this->player];
     int self_score = 0, oppn_score = 0;
+    int self_material = 0, oppn_material = 0;
+    int self_pawn_structure = 0, oppn_pawn_structure = 0;
+    int self_king_threat = 0, oppn_king_threat = 0;
 
     if(use_kp_eval){
         /* === KP eval: material + PST + tropism === */
@@ -346,6 +508,8 @@ int State::evaluate(
             }
         }
 
+        self_king_threat = king_threat_score(self_kr, self_kc, this->player, 1 - this->player);
+        oppn_king_threat = king_threat_score(oppn_kr, oppn_kc, 1 - this->player, this->player);
 
         // [ Hackathon TODO 1-4 ]
         // sum player/opponent pieces' value and add to score
@@ -360,8 +524,12 @@ int State::evaluate(
                     int p_row = (this->player == 0) ? r : (BOARD_H - 1 - r);
                     self_score += kp_material[self_piece];
                     self_score += pst[self_piece - 1][p_row][c];
+                    self_material += kp_material[self_piece];
+                    if(self_piece == 1){
+                        self_pawn_structure += this->pawn_structure_score(r, c, this->player);
+                    }
                     
-                    if(oppn_kr != -1){
+                    if(oppn_kr != -1 && king_tropism_applicable(this, self_piece, r, c, this->player)){
                         self_score += king_tropism(self_piece, r, c, oppn_kr, oppn_kc);
                     }
                 }
@@ -371,8 +539,12 @@ int State::evaluate(
                     int o_row = (this->player == 1) ? r : (BOARD_H - 1 - r);
                     oppn_score += kp_material[oppn_piece];
                     oppn_score += pst[oppn_piece - 1][o_row][c];
+                    oppn_material += kp_material[oppn_piece];
+                    if(oppn_piece == 1){
+                        oppn_pawn_structure += this->pawn_structure_score(r, c, 1 - this->player);
+                    }
                     
-                    if(self_kr != -1){
+                    if(self_kr != -1 && king_tropism_applicable(this, oppn_piece, r, c, 1 - this->player)){
                         oppn_score += king_tropism(oppn_piece, r, c, self_kr, self_kc);
                     }
                 }
@@ -401,6 +573,15 @@ int State::evaluate(
     }
 
     int bonus = 0;
+
+    if(use_kp_eval && self_material == oppn_material){
+        int self_space = this->space_score(this->player);
+        int oppn_space = this->space_score(1 - this->player);
+        bonus += self_space - oppn_space;
+    }
+
+    bonus += self_pawn_structure - oppn_pawn_structure;
+    bonus += oppn_king_threat - self_king_threat;
 
     /* === Mobility bonus === */
     if(use_mobility){

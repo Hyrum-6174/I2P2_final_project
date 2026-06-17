@@ -86,5 +86,9 @@ public:
     int count_attackers_on_square(int target_r, int target_c, int attacker_player) const;
     int count_defenders_on_square(int target_r, int target_c, int defender_player) const;
     bool attacks_square(int r, int c, int player, int target_r, int target_c) const;
+    int space_score(int player) const;
+    int pawn_structure_score(int pr, int pc, int player) const;
+    int king_threat_score(int king_r, int king_c, int owner, int attacker) const;
+    int move_order_score(const Move& action, const State* next) const;
     bool is_pinned_piece(int piece_r, int piece_c, int target_player) const;
 };

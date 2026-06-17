@@ -53,6 +53,7 @@ int PVS::eval_ctx(
         int quick = next->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
         bool same = next->same_player_as_parent();
         int qscore = same ? quick : -quick;
+        qscore += state->move_order_score(action, next);
         if(killers[ply] == action){
             qscore += 100000;
         }
@@ -143,6 +144,7 @@ SearchResult PVS::search(
         int quick = next->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
         bool same = next->same_player_as_parent();
         int qscore = same ? quick : -quick;
+        qscore += state->move_order_score(action, next);
         root_scored.emplace_back(qscore, action);
         delete next;
     }
