@@ -42,6 +42,26 @@ static const int pst[6][BOARD_H][BOARD_W] = {
      {-4, -4, -4, -4, -4}, { 4,  4,  0,  4,  4}, { 6,  6,  2,  6,  6}},
 };
 
+// Endgame Piece-Square Tables (White perspective, mirror for black)
+// In the endgame, the King should centralize, and Pawns are heavily rewarded for pushing.
+static const int pst_eg_king[6][BOARD_W] = {
+    {-2,  0,  2,  0, -2},
+    { 0,  2,  4,  2,  0},
+    { 2,  4,  6,  4,  2},
+    { 2,  4,  6,  4,  2},
+    { 0,  2,  4,  2,  0},
+    {-2,  0,  2,  0, -2}
+};
+
+static const int pst_eg_pawn[6][BOARD_W] = {
+    { 0,  0,  0,  0,  0},
+    {30, 30, 30, 30, 30}, // Heavy bonus for almost promoting
+    {20, 22, 24, 22, 20},
+    {10, 12, 14, 12, 10},
+    { 5,  5,  5,  5,  5},
+    { 0,  0,  0,  0,  0}
+};
+
 // King tropism weights
 static const int tropism_w[7] = {0, 0, 3, 3, 2, 5, 0};
 
@@ -489,6 +509,59 @@ int State::evaluate(
     int self_pawn_structure = 0, oppn_pawn_structure = 0;
     int self_king_threat = 0, oppn_king_threat = 0;
 
+    // Track material to determine game phase (Endgame detection)
+    bool self_has_queen = false;
+    bool oppn_has_queen = false;
+    int self_non_pawn_mat = 0;
+    int oppn_non_pawn_mat = 0;
+
+    // --- PAWN HASHING & MAPS ---
+    // Pre-calculate pawn attacks and file occupancies to efficiently evaluate 
+    // outposts, safe mobility, and open files.
+    bool self_pawn_on_file[BOARD_W] = {false};
+    bool oppn_pawn_on_file[BOARD_W] = {false};
+    bool self_pawn_attacks[BOARD_H][BOARD_W] = {false};
+    bool oppn_pawn_attacks[BOARD_H][BOARD_W] = {false};
+
+    int self_pawn_dir = (this->player == 0) ? -1 : 1;
+    int oppn_pawn_dir = ((1 - this->player) == 0) ? -1 : 1;
+
+    for (int r = 0; r < BOARD_H; r++) {
+        for (int c = 0; c < BOARD_W; c++) {
+            // Map Self Pawns
+            if (self_board[r][c] == 1) {
+                self_has_queen = (self_board[r][c] == 5) ? true : self_has_queen; // Quick check logic fix below
+                self_pawn_on_file[c] = true;
+                int ar = r + self_pawn_dir;
+                if (ar >= 0 && ar < BOARD_H) {
+                    if (c > 0) self_pawn_attacks[ar][c - 1] = true;
+                    if (c < BOARD_W - 1) self_pawn_attacks[ar][c + 1] = true;
+                }
+            } else {
+                int sp = self_board[r][c];
+                if(sp == 5) self_has_queen = true;
+                if(sp > 1 && sp < 6) self_non_pawn_mat += kp_material[sp];
+            }
+
+            // Map Opponent Pawns
+            if (oppn_board[r][c] == 1) {
+                oppn_pawn_on_file[c] = true;
+                int ar = r + oppn_pawn_dir;
+                if (ar >= 0 && ar < BOARD_H) {
+                    if (c > 0) oppn_pawn_attacks[ar][c - 1] = true;
+                    if (c < BOARD_W - 1) oppn_pawn_attacks[ar][c + 1] = true;
+                }
+            } else {
+                int op = oppn_board[r][c];
+                if(op == 5) oppn_has_queen = true;
+                if(op > 1 && op < 6) oppn_non_pawn_mat += kp_material[op];
+            }
+        }
+    }
+
+    // We enter the endgame if both queens are traded, OR if material is very low
+    bool is_endgame = (!self_has_queen && !oppn_has_queen) || (self_non_pawn_mat < 100 && oppn_non_pawn_mat < 100);
+
     if(use_kp_eval){
         /* === KP eval: material + PST + tropism === */
 
@@ -519,8 +592,17 @@ int State::evaluate(
                     // White orientation index mapping for PST (mirror for black player index 1)
                     int p_row = (this->player == 0) ? r : (BOARD_H - 1 - r);
                     self_score += kp_material[self_piece];
-                    self_score += pst[self_piece - 1][p_row][c];
                     self_material += kp_material[self_piece];
+
+                    // Phase-specific Piece Square Tables
+                    if (is_endgame && self_piece == 6) {
+                        self_score += pst_eg_king[p_row][c]; // Centralize King
+                    } else if (is_endgame && self_piece == 1) {
+                        self_score += pst_eg_pawn[p_row][c]; // Push Pawns
+                    } else {
+                        self_score += pst[self_piece - 1][p_row][c];
+                    }
+
                     if(self_piece == 1){
                         self_pawn_structure += this->pawn_structure_score(r, c, this->player);
                     }
@@ -528,20 +610,149 @@ int State::evaluate(
                     if(oppn_kr != -1 && king_tropism_applicable(this, self_piece, r, c, this->player)){
                         self_score += king_tropism(self_piece, r, c, oppn_kr, oppn_kc);
                     }
+
+                    // 1. Open and Half-Open Files (Rooks & Queens)
+                    if (self_piece == 2 || self_piece == 5) {
+                        if (!self_pawn_on_file[c]) {
+                            self_score += (self_piece == 2) ? 15 : 5; // Half-open file
+                            if (!oppn_pawn_on_file[c]) {
+                                self_score += (self_piece == 2) ? 10 : 5; // Fully-open file (+25 total for Rooks)
+                            }
+                        }
+                    }
+
+                    // 2. Outposts & Strong Squares (Knights & Bishops)
+                    if (self_piece == 3 || self_piece == 4) {
+                        // Is it defended by our pawn?
+                        if (self_pawn_attacks[r][c]) {
+                            bool can_be_attacked_by_pawn = false;
+                            for (int ac = std::max(0, c - 1); ac <= std::min(BOARD_W - 1, c + 1); ac += 2) {
+                                // Scan backwards to see if an enemy pawn could march down to attack this square
+                                for (int ar = r; ar >= 0 && ar < BOARD_H; ar -= oppn_pawn_dir) {
+                                    if (oppn_board[ar][ac] == 1) {
+                                        can_be_attacked_by_pawn = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!can_be_attacked_by_pawn) {
+                                self_score += (self_piece == 3) ? 20 : 10; // Knights get a huge outpost bonus
+                                if (p_row >= BOARD_H / 2) self_score += 15; // Bonus if deep in enemy territory
+                            }
+                        }
+                    }
+
+                    // 3. Safe Mobility (Preventing trapped/restricted minor pieces)
+                    if (self_piece == 3) { // Knight Safe Squares
+                        int safe_squares = 0;
+                        int kr[] = {-1, -1, 1, 1, 2, 2, -2, -2};
+                        int kc[] = {2, -2, 2, -2, 1, -1, 1, -1};
+                        for (int i = 0; i < 8; i++) {
+                            int nr = r + kr[i], nc = c + kc[i];
+                            if (nr >= 0 && nr < BOARD_H && nc >= 0 && nc < BOARD_W) {
+                                if (self_board[nr][nc] == 0 && !oppn_pawn_attacks[nr][nc]) safe_squares++;
+                            }
+                        }
+                        if (safe_squares == 0) self_score -= 25; // Heavily penalize a knight with no safe jumps
+                        else self_score += safe_squares * 3;     // Reward controlling safe squares
+                    }
+                    if (self_piece == 4) { // Bishop Safe Squares
+                        int safe_squares = 0;
+                        int br[] = {1, 1, -1, -1}, bc[] = {1, -1, 1, -1};
+                        for (int d = 0; d < 4; d++) {
+                            int nr = r + br[d], nc = c + bc[d];
+                            while (nr >= 0 && nr < BOARD_H && nc >= 0 && nc < BOARD_W) {
+                                if (self_board[nr][nc] > 0) break;
+                                if (!oppn_pawn_attacks[nr][nc]) safe_squares++;
+                                if (oppn_board[nr][nc] > 0) break;
+                                nr += br[d]; nc += bc[d];
+                            }
+                        }
+                        if (safe_squares == 0) self_score -= 20;
+                        else self_score += safe_squares * 2;
+                    }
                 }
 
                 int oppn_piece = oppn_board[r][c];
                 if(oppn_piece > 0 && oppn_piece <= 6){
                     int o_row = (this->player == 1) ? r : (BOARD_H - 1 - r);
                     oppn_score += kp_material[oppn_piece];
-                    oppn_score += pst[oppn_piece - 1][o_row][c];
                     oppn_material += kp_material[oppn_piece];
+
+                    // Phase-specific Piece Square Tables
+                    if (is_endgame && oppn_piece == 6) {
+                        oppn_score += pst_eg_king[o_row][c];
+                    } else if (is_endgame && oppn_piece == 1) {
+                        oppn_score += pst_eg_pawn[o_row][c];
+                    } else {
+                        oppn_score += pst[oppn_piece - 1][o_row][c];
+                    }
+
                     if(oppn_piece == 1){
                         oppn_pawn_structure += this->pawn_structure_score(r, c, 1 - this->player);
                     }
                     
                     if(self_kr != -1 && king_tropism_applicable(this, oppn_piece, r, c, 1 - this->player)){
                         oppn_score += king_tropism(oppn_piece, r, c, self_kr, self_kc);
+                    }
+
+                    // 1. Open and Half-Open Files
+                    if (oppn_piece == 2 || oppn_piece == 5) {
+                        if (!oppn_pawn_on_file[c]) {
+                            oppn_score += (oppn_piece == 2) ? 15 : 5;
+                            if (!self_pawn_on_file[c]) {
+                                oppn_score += (oppn_piece == 2) ? 10 : 5; 
+                            }
+                        }
+                    }
+
+                    // 2. Outposts & Strong Squares
+                    if (oppn_piece == 3 || oppn_piece == 4) {
+                        if (oppn_pawn_attacks[r][c]) {
+                            bool can_be_attacked_by_pawn = false;
+                            for (int ac = std::max(0, c - 1); ac <= std::min(BOARD_W - 1, c + 1); ac += 2) {
+                                for (int ar = r; ar >= 0 && ar < BOARD_H; ar -= self_pawn_dir) {
+                                    if (self_board[ar][ac] == 1) {
+                                        can_be_attacked_by_pawn = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!can_be_attacked_by_pawn) {
+                                oppn_score += (oppn_piece == 3) ? 20 : 10;
+                                if (o_row >= BOARD_H / 2) oppn_score += 15; 
+                            }
+                        }
+                    }
+
+                    // 3. Safe Mobility
+                    if (oppn_piece == 3) {
+                        int safe_squares = 0;
+                        int kr[] = {-1, -1, 1, 1, 2, 2, -2, -2};
+                        int kc[] = {2, -2, 2, -2, 1, -1, 1, -1};
+                        for (int i = 0; i < 8; i++) {
+                            int nr = r + kr[i], nc = c + kc[i];
+                            if (nr >= 0 && nr < BOARD_H && nc >= 0 && nc < BOARD_W) {
+                                if (oppn_board[nr][nc] == 0 && !self_pawn_attacks[nr][nc]) safe_squares++;
+                            }
+                        }
+                        if (safe_squares == 0) oppn_score -= 25;
+                        else oppn_score += safe_squares * 3;
+                    }
+                    if (oppn_piece == 4) {
+                        int safe_squares = 0;
+                        int br[] = {1, 1, -1, -1}, bc[] = {1, -1, 1, -1};
+                        for (int d = 0; d < 4; d++) {
+                            int nr = r + br[d], nc = c + bc[d];
+                            while (nr >= 0 && nr < BOARD_H && nc >= 0 && nc < BOARD_W) {
+                                if (oppn_board[nr][nc] > 0) break;
+                                if (!self_pawn_attacks[nr][nc]) safe_squares++;
+                                if (self_board[nr][nc] > 0) break;
+                                nr += br[d]; nc += bc[d];
+                            }
+                        }
+                        if (safe_squares == 0) oppn_score -= 20;
+                        else oppn_score += safe_squares * 2;
                     }
                 }
             }
@@ -570,6 +781,11 @@ int State::evaluate(
 
     int bonus = 0;
 
+    // Tempo bonus: Giving a small flat score to the side to move improves move ordering and deep search accuracy
+    if (use_kp_eval) {
+        bonus += 8; // Small advantage for holding the initiative
+    }
+
     if(use_kp_eval && self_material == oppn_material){
         int self_space = this->space_score(this->player);
         int oppn_space = this->space_score(1 - this->player);
@@ -577,7 +793,12 @@ int State::evaluate(
     }
 
     bonus += self_pawn_structure - oppn_pawn_structure;
-    bonus += oppn_king_threat - self_king_threat;
+    // In the endgame, king safety matters a lot less, but still somewhat relevant
+    if (is_endgame) {
+        bonus += (oppn_king_threat - self_king_threat) / 2;
+    } else {
+        bonus += oppn_king_threat - self_king_threat;
+    }
 
     /* === Mobility bonus === */
     if(use_mobility){

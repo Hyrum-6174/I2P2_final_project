@@ -19,6 +19,7 @@
 #include "PVS.hpp"
 #include "Quiescence.hpp"
 #include "mtdf_id.hpp"
+#include "beth.hpp"
 
 struct AlgoEntry {
     std::string name;
@@ -67,6 +68,14 @@ inline const std::vector<AlgoEntry>& get_algo_table(){
             MTDF_ID::param_defs(),
             [](State* s, int d, GameHistory& h, SearchContext& c){
                 return MTDF_ID::search(s, d, h, c);
+            }
+        },
+        {
+            "beth",
+            BethSearch::default_params(),
+            BethSearch::param_defs(),
+            [](State* s, int d, GameHistory& h, SearchContext& c){
+                return BethSearch::search(s, d, h, c);
             }
         },
         {

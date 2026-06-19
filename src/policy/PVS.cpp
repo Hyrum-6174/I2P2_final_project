@@ -112,7 +112,7 @@ int PVS::eval_ctx(
     }
 
     history.pop(state->hash());
-    return best_score;
+    return alpha;
 }
 
 SearchResult PVS::search(

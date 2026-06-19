@@ -4,6 +4,82 @@
 #include <chrono>
 #include "mtdf_id.hpp"
 #include "state.hpp"
+#include <limits>
+
+namespace {
+    constexpr Move NO_MOVE = {{-1, -1}, {-1, -1}};
+
+    inline bool same_move(const Move& a, const Move& b) {
+        return a.first.first  == b.first.first &&
+               a.first.second == b.first.second &&
+               a.second.first == b.second.first &&
+               a.second.second == b.second.second;
+    }
+
+    inline int piece_value(int piece) {
+        switch (piece) {
+            case 1: return 100;
+            case 2: return 300;
+            case 3: return 500;
+            case 4: return 900;
+            case 5: return 1000;
+            default: return 0;
+        }
+    }
+
+    inline int quiet_history_index(const State* s, const Move& mv) {
+        const int w = s->board_w();
+        const int h = s->board_h();
+        const int cells = w * h;
+        const int from_sq = mv.first.first * w + mv.first.second;
+        const int to_sq   = mv.second.first * w + mv.second.second;
+        return from_sq * cells + to_sq;
+    }
+
+    inline bool is_tactical_move(const State* s, const Move& mv) {
+        const int opp = 1 - s->player;
+        const int tr = mv.second.first;
+        const int tc = mv.second.second;
+
+        const int captured = s->piece_at(opp, tr, tc);
+        const int moving   = s->piece_at(s->player, mv.first.first, mv.first.second);
+        const bool promo = (moving == 1 && (tr == 0 || tr == s->board_h() - 1));
+
+        return captured != 0 || promo;
+    }
+
+    inline int tactical_move_score(const State* s, const Move& mv, const State* next) {
+        const int opp = 1 - s->player;
+        const int tr = mv.second.first;
+        const int tc = mv.second.second;
+
+        const int captured = s->piece_at(opp, tr, tc);
+        const int moving   = s->piece_at(s->player, mv.first.first, mv.first.second);
+
+        int score = 0;
+
+        if (captured != 0) {
+            score += 100000 + 10 * piece_value(captured) - piece_value(moving);
+        }
+
+        if (moving == 1 && (tr == 0 || tr == s->board_h() - 1)) {
+            score += 20000;
+        }
+
+        if (next->same_player_as_parent()) {
+            score += 15000;
+        }
+
+        score += s->move_order_score(mv, next);
+        return score;
+    }
+
+    inline int quiet_move_score(const State* s, const Move& mv, const std::vector<int>& history_table) {
+        int score = 0;
+        score += history_table[quiet_history_index(s, mv)];
+        return score;
+    }
+}
 
 // --- Transposition Table Setup ---
 enum TTFlag : uint8_t { TT_EXACT = 0, TT_LOWERBOUND = 1, TT_UPPERBOUND = 2 };
@@ -16,8 +92,9 @@ struct TTEntry {
     TTFlag flag = TT_EXACT;
 };
 
-// 1 << 23 entries = ~8.3 million entries (approx 200MB, safely inside 4GB limit)
-const size_t TT_SIZE = 1 << 23;
+// Declared sizes up here so TT_MASK compiles successfully
+constexpr size_t TT_SIZE = 1 << 23; 
+static constexpr size_t TT_MASK = TT_SIZE - 1;
 static std::vector<TTEntry> TT;
 
 // --- Quiescence Search (Tactical extension) ---
@@ -31,60 +108,75 @@ int MTDF_ID::qsearch(
     const MtdfParams& p
 ){
     ctx.nodes++;
-    if(ply > ctx.seldepth) ctx.seldepth = ply;
-    if(ctx.stop) return 0;
+    if (ply > ctx.seldepth) ctx.seldepth = ply;
+    if (ctx.stop) return 0;
 
-    if(state->legal_actions.empty() && state->game_state == UNKNOWN){
+    if (state->legal_actions.empty() && state->game_state == UNKNOWN) {
         state->get_legal_actions();
     }
 
-    if(state->game_state == WIN) return P_MAX - ply;
-    if(state->game_state == DRAW) return 0;
+    if (state->game_state == WIN)  return P_MAX - ply;
+    if (state->game_state == DRAW) return 0;
 
     int rep_score;
-    if(state->check_repetition(history, rep_score)) return rep_score;
+    if (state->check_repetition(history, rep_score)) return rep_score;
 
-    int stand_pat = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
-    if(stand_pat >= beta) return beta;
-    if(stand_pat > alpha) alpha = stand_pat;
+    const int stand_pat = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
+    if (stand_pat >= beta) return beta;
+    if (stand_pat > alpha) alpha = stand_pat;
 
     history.push(state->hash());
 
-    std::vector<std::pair<int, Move>> scored;
-    scored.reserve(state->legal_actions.size());
+    std::vector<std::pair<int, Move>> tactical;
+    tactical.reserve(state->legal_actions.size());
 
-    int opp = 1 - state->player;
-    for(auto &action : state->legal_actions){
-        int target_r = action.second.first;
-        int target_c = action.second.second;
+    int max_tactical_gain = 0;
 
-        int captured = state->piece_at(opp, target_r, target_c);
-        int moving_piece = state->piece_at(state->player, action.first.first, action.first.second);
-        bool is_promotion = (moving_piece == 1 && (target_r == 0 || target_r == state->board_h() - 1));
-
-        if(captured == 0 && !is_promotion) continue; 
+    for (const auto& action : state->legal_actions) {
+        if (!is_tactical_move(state, action)) continue;
 
         State* next = state->next_state(action);
-        int quick = next->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
-        bool same = next->same_player_as_parent();
-        int qscore = same ? quick : -quick;
-        qscore += state->move_order_score(action, next);
-        
-        scored.emplace_back(qscore, action);
+        const int score = tactical_move_score(state, action, next);
+        tactical.emplace_back(score, action);
+
+        const int opp = 1 - state->player;
+        const int tr = action.second.first;
+        const int tc = action.second.second;
+        const int captured = state->piece_at(opp, tr, tc);
+        const int moving = state->piece_at(state->player, action.first.first, action.first.second);
+
+        int gain = 0;
+        if (captured != 0) gain += piece_value(captured) - piece_value(moving);
+        if (moving == 1 && (tr == 0 || tr == state->board_h() - 1)) gain += 200;
+        if (next->same_player_as_parent()) gain += 100;
+
+        if (gain > max_tactical_gain) max_tactical_gain = gain;
+
         delete next;
     }
 
-    std::sort(scored.begin(), scored.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+    if (tactical.empty()) {
+        history.pop(state->hash());
+        return stand_pat;
+    }
+
+    const int delta_margin = 150;
+    if (stand_pat + max_tactical_gain + delta_margin <= alpha) {
+        history.pop(state->hash());
+        return alpha;
+    }
+
+    std::sort(tactical.begin(), tactical.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
 
     int best_score = stand_pat;
 
-    for(auto &ps : scored){
+    for (const auto& ps : tactical) {
         const Move action = ps.second;
         State* next = state->next_state(action);
-        bool same = next->same_player_as_parent();
 
         int score;
-        if(same) {
+        if (next->same_player_as_parent()) {
             score = qsearch(next, history, ply + 1, ctx, alpha, beta, p);
         } else {
             score = -qsearch(next, history, ply + 1, ctx, -beta, -alpha, p);
@@ -92,9 +184,10 @@ int MTDF_ID::qsearch(
 
         delete next;
 
-        if(score > best_score) best_score = score;
-        if(score > alpha) alpha = score;
-        if(alpha >= beta) break; 
+        if (score > best_score) best_score = score;
+        if (score > alpha) alpha = score;
+        if (alpha >= beta) break;
+        if (ctx.stop) break;
     }
 
     history.pop(state->hash());
@@ -114,115 +207,166 @@ int MTDF_ID::eval_memory(
     const MtdfParams& p,
     const std::chrono::high_resolution_clock::time_point& t0
 ){
-    // 1. Time Check: Guard against timeout inside deep loops
-    if ((ctx.nodes & 2047) == 0) { // Every ~2000 nodes
+    if ((ctx.nodes & 1023) == 0) {
         auto t_now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration<double, std::milli>(t_now - t0).count() > 9500) {
-            ctx.stop = true; 
+            ctx.stop = true;
+            return 0;
         }
     }
 
     ctx.nodes++;
-    if(ply > ctx.seldepth) ctx.seldepth = ply;
-    if(ctx.stop) return 0;
+    if (ply > ctx.seldepth) ctx.seldepth = ply;
+    if (ctx.stop) return 0;
 
-    int original_alpha = alpha;
-    uint64_t hash = state->hash();
-    TTEntry& tte = TT[hash % TT_SIZE];
-    Move tt_move = {{-1, -1}, {-1, -1}};
+    const int original_alpha = alpha;
+    const uint64_t hash = state->hash();
+    TTEntry& tte = TT[hash & TT_MASK];
 
-    // 2. Transposition Table Lookup
+    Move tt_move = NO_MOVE;
+
     if (p.use_tt && tte.hash == hash) {
         tt_move = tte.best_move;
         if (tte.depth >= depth) {
-            if (tte.flag == TT_EXACT) return tte.score;
-            if (tte.flag == TT_UPPERBOUND && tte.score <= alpha) return alpha;
-            if (tte.flag == TT_LOWERBOUND && tte.score >= beta) return beta;
+            if (tte.flag == TT_EXACT)       return tte.score;
+            if (tte.flag == TT_UPPERBOUND && tte.score <= alpha) return tte.score;
+            if (tte.flag == TT_LOWERBOUND && tte.score >= beta)  return tte.score;
         }
     }
 
-    // 3. Base Cases
-    if(state->legal_actions.empty() && state->game_state == UNKNOWN){
+    if (state->legal_actions.empty() && state->game_state == UNKNOWN) {
         state->get_legal_actions();
     }
-    if(state->game_state == WIN) return P_MAX - ply;
-    if(state->game_state == DRAW) return 0;
+    if (state->game_state == WIN)  return P_MAX - ply;
+    if (state->game_state == DRAW) return 0;
 
     int rep_score;
-    if(state->check_repetition(history, rep_score)) return rep_score;
+    if (state->check_repetition(history, rep_score)) return rep_score;
 
-    if(depth <= 0){
+    if (depth <= 0) {
         return qsearch(state, history, ply, ctx, alpha, beta, p);
     }
 
     history.push(hash);
 
-    static thread_local std::vector<Move> killers(256);
-    if((int)killers.size() <= ply) killers.resize(ply + 1);
+    static thread_local std::vector<std::array<Move, 2>> killers;
+    static thread_local std::vector<int> history_table;
+    static thread_local int hist_w = 0;
+    static thread_local int hist_h = 0;
 
-    // 4. Move Ordering
-    std::vector<std::pair<int, Move>> scored;
-    scored.reserve(state->legal_actions.size());
-    for(auto &action : state->legal_actions){
-        int qscore = 0;
-        if (action == tt_move) {
-            qscore = 2000000; // Best prior move tested first
-        } else if (action == killers[ply]) {
-            qscore = 1000000; // Killers next
-        } else {
-            State* next = state->next_state(action);
-            int quick = next->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
-            bool same = next->same_player_as_parent();
-            qscore = same ? quick : -quick;
-            qscore += state->move_order_score(action, next);
-            delete next;
-        }
-        scored.emplace_back(qscore, action);
+    const int w = state->board_w();
+    const int h = state->board_h();
+    const int cells = w * h;
+
+    if (hist_w != w || hist_h != h) {
+        hist_w = w;
+        hist_h = h;
+        history_table.assign(cells * cells, 0);
+        killers.assign(256, std::array<Move, 2>{NO_MOVE, NO_MOVE});
+    } else if ((int)killers.size() <= ply) {
+        killers.resize(ply + 1, std::array<Move, 2>{NO_MOVE, NO_MOVE});
     }
 
-    std::sort(scored.begin(), scored.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+    const Move root_hint = root_best_move;
 
-    int best_score = M_MAX; // Use proper lower limit
-    Move best_move_found = {{-1, -1}, {-1, -1}};
+    std::vector<Move> ordered;
+    ordered.reserve(state->legal_actions.size());
 
-    for(auto &ps : scored){
-        const Move action = ps.second;
+    std::vector<std::pair<int, Move>> tactical;
+    tactical.reserve(state->legal_actions.size());
+
+    for (const auto& action : state->legal_actions) {
+        if (p.use_tt && same_move(action, tt_move)) {
+            ordered.push_back(action);
+            continue;
+        }
+
+        // Fix: Only apply root hint ordering when ply is exactly 0
+        if (ply == 0 && same_move(action, root_hint)) {
+            ordered.push_back(action);
+            continue;
+        }
+
+        if (same_move(action, killers[ply][0]) || same_move(action, killers[ply][1])) {
+            ordered.push_back(action);
+            continue;
+        }
+
+        if (is_tactical_move(state, action)) {
+            State* next = state->next_state(action);
+            const int score = tactical_move_score(state, action, next);
+            tactical.emplace_back(score, action);
+            delete next;
+        } else {
+            const int score = quiet_move_score(state, action, history_table);
+            tactical.emplace_back(score, action);
+        }
+    }
+
+    std::sort(tactical.begin(), tactical.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    for (const auto& x : tactical) ordered.push_back(x.second);
+
+    int best_score = -P_MAX;
+    Move best_move_found = NO_MOVE;
+
+    for (const auto& action : ordered) {
         State* next = state->next_state(action);
-        bool same = next->same_player_as_parent();
+        const bool same = next->same_player_as_parent();
 
         int score;
-        if(same) {
+        if (same) {
             score = eval_memory(next, depth - 1, history, ply + 1, ctx, alpha, beta, root_best_move, p, t0);
         } else {
             score = -eval_memory(next, depth - 1, history, ply + 1, ctx, -beta, -alpha, root_best_move, p, t0);
         }
+
         delete next;
 
-        if (ctx.stop) { history.pop(hash); return 0; }
+        if (ctx.stop) {
+            history.pop(hash);
+            return 0;
+        }
 
-        if(score > best_score) {
+        if (score > best_score) {
             best_score = score;
             best_move_found = action;
-            if (ply == 0) root_best_move = action; // Capture real root move
+            if (ply == 0) root_best_move = action;
         }
-        if(best_score > alpha) alpha = best_score;
-        if(alpha >= beta){
-            killers[ply] = action;
-            break; 
+
+        if (score > alpha) alpha = score;
+
+        if (alpha >= beta) {
+            if (!same_move(action, tt_move)) {
+                killers[ply][1] = killers[ply][0];
+                killers[ply][0] = action;
+            }
+
+            if (!is_tactical_move(state, action)) {
+                const int idx = quiet_history_index(state, action);
+                history_table[idx] += depth * depth;
+                if (history_table[idx] > 1000000000) {
+                    for (int& v : history_table) v >>= 1;
+                }
+            }
+            break;
         }
     }
 
     history.pop(hash);
 
-    // 5. Store in TT
     if (p.use_tt && !ctx.stop) {
-        tte.hash = hash;
-        tte.depth = depth;
-        tte.score = best_score;
-        tte.best_move = best_move_found;
-        if (best_score <= original_alpha) tte.flag = TT_UPPERBOUND;
-        else if (best_score >= beta) tte.flag = TT_LOWERBOUND;
-        else tte.flag = TT_EXACT;
+        if (tte.hash != hash || depth >= tte.depth) {
+            tte.hash = hash;
+            tte.depth = depth;
+            tte.score = best_score;
+            tte.best_move = best_move_found;
+
+            if (best_score <= original_alpha) tte.flag = TT_UPPERBOUND;
+            else if (best_score >= beta)     tte.flag = TT_LOWERBOUND;
+            else                             tte.flag = TT_EXACT;
+        }
     }
 
     return best_score;
@@ -274,8 +418,6 @@ SearchResult MTDF_ID::search(
     int first_guess = 0;
     Move current_best_move = result.best_move;
 
-    // Time-bound ID loop. We ignore 'max_depth' parameter and run purely on time constraints if needed
-    // However, we respect max_depth if it was passed explicitly by a GUI/Engine testing protocol.
     int limit_depth = (max_depth > 0 && max_depth < 100) ? max_depth : 100;
 
     for (int d = 1; d <= limit_depth; d++) {
@@ -284,21 +426,18 @@ SearchResult MTDF_ID::search(
         Move depth_best_move = current_best_move;
         int score = mtdf(state, first_guess, d, history, ctx, p, depth_best_move, t0);
 
-        if (ctx.stop) break; // Time ran out during this depth, discard polluted result
+        if (ctx.stop) break; 
 
-        // Commit successful depth results
         first_guess = score;
         current_best_move = depth_best_move;
         result.best_move = current_best_move;
         result.score = score;
         result.depth = d;
 
-        // Immediately report to game runner
         if(p.report_partial && ctx.on_root_update){
             ctx.on_root_update({result.best_move, score, d, 1, 1});
         }
 
-        // Check overall clock after depth completion
         auto t_now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration<double, std::milli>(t_now - t0).count() > 9500) {
             break; 
