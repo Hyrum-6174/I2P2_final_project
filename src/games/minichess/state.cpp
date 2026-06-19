@@ -76,10 +76,6 @@ static bool king_tropism_applicable(
         return true;
     }
 
-    // Allow tropism if the piece is already attacking enemy material.
-    if(state->count_attacked_pieces(pr, pc, player) > 0){
-        return true;
-    }
 
     return false;
 }
@@ -613,12 +609,20 @@ int State::evaluate(
     // Evaluate our forking opportunities
     int self_fork_bonus = 0;
     int oppn_fork_penalty = 0;
+    int hanging_piece_penalty = 0;
     
     // Check our pieces for forks
     for(int r = 0; r < BOARD_H; r++){
         for(int c = 0; c < BOARD_W; c++){
             int piece = self_board[r][c];
             if(piece > 0 && piece <= 5){ // exclude king
+                int attackers = const_cast<State*>(this)->count_attackers_on_square(r, c, 1 - this->player);
+                int defenders = const_cast<State*>(this)->count_defenders_on_square(r, c, this->player);
+                if (attackers > defenders) {
+                    // Heavily penalize leaving undefended or overwhelmed pieces on the board
+                    hanging_piece_penalty += (kp_material[piece] / 2);
+                }
+                
                 int attacked = const_cast<State*>(this)->count_attacked_pieces(r, c, this->player);
                 
                 // If this piece forks (attacks 2+ pieces), reward it
@@ -629,12 +633,8 @@ int State::evaluate(
                     // If the forking piece is defended, increase the bonus
                     if(const_cast<State*>(this)->is_defended(r, c, this->player)){
                         fork_value += 10;
-                    } else {
-                        // If not defended, reduce the bonus (risky fork)
-                        fork_value = fork_value / 2;
+                        self_fork_bonus += fork_value;
                     }
-                    
-                    self_fork_bonus += fork_value;
                 }
             }
         }
@@ -645,6 +645,13 @@ int State::evaluate(
         for(int c = 0; c < BOARD_W; c++){
             int piece = oppn_board[r][c];
             if(piece > 0 && piece <= 5){ // exclude king
+                int attackers = const_cast<State*>(this)->count_attackers_on_square(r, c, this->player);
+                int defenders = const_cast<State*>(this)->count_defenders_on_square(r, c, 1 - this->player);
+                if (attackers > defenders) {
+                    // Reward us if the opponent leaves a piece hanging
+                    hanging_piece_penalty -= (kp_material[piece] / 2);
+                }
+                
                 int attacked = const_cast<State*>(this)->count_attacked_pieces(r, c, 1 - this->player);
                 
                 // If opponent can fork our pieces, penalize us
@@ -654,9 +661,8 @@ int State::evaluate(
                     // If opponent's forking piece is defended, penalize more
                     if(const_cast<State*>(this)->is_defended(r, c, 1 - this->player)){
                         fork_vulnerability += 10;
+                        oppn_fork_penalty += fork_vulnerability;
                     }
-                    
-                    oppn_fork_penalty += fork_vulnerability;
                 }
             }
         }
