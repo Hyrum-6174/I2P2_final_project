@@ -257,12 +257,6 @@ int State::count_defenders_on_square(int target_r, int target_c, int defender_pl
     return count_attackers_on_square(target_r, target_c, defender_player);
 }
 
-int State::space_score(int player) const {
-    State temp(this->board, player);
-    temp.get_legal_actions();
-    return temp.legal_actions.size();
-}
-
 int State::pawn_structure_score(int pr, int pc, int player) const {
     if(this->board.board[player][pr][pc] != 1) return 0;
 
@@ -379,7 +373,9 @@ int State::move_order_score(const Move& action, const State* next) const {
     int dest_c = action.second.second;
     int captured = this->board.board[enemy][dest_r][dest_c];
     if(captured > 0){
-        score += 8;
+        int attacker = this->board.board[this->player][from_r][from_c];
+
+        score += (10 * kp_material[captured] - kp_material[attacker]) / 10;
     }
 
     bool discovered = false;
@@ -786,12 +782,6 @@ int State::evaluate(
         bonus += 8; // Small advantage for holding the initiative
     }
 
-    if(use_kp_eval && self_material == oppn_material){
-        int self_space = this->space_score(this->player);
-        int oppn_space = this->space_score(1 - this->player);
-        bonus += self_space - oppn_space;
-    }
-
     bonus += self_pawn_structure - oppn_pawn_structure;
     // In the endgame, king safety matters a lot less, but still somewhat relevant
     if (is_endgame) {
@@ -831,6 +821,12 @@ int State::evaluate(
     int self_fork_bonus = 0;
     int oppn_fork_penalty = 0;
     int hanging_piece_penalty = 0;
+
+    // Defense load mapping arrays
+    int self_defense_load[BOARD_H][BOARD_W] = {0};
+    int oppn_defense_load[BOARD_H][BOARD_W] = {0};
+    int self_overload_penalty = 0;
+    int oppn_overload_penalty = 0;
     
     // Check our pieces for forks
     for(int r = 0; r < BOARD_H; r++){
@@ -842,6 +838,17 @@ int State::evaluate(
                 if (attackers > defenders) {
                     // Heavily penalize leaving undefended or overwhelmed pieces on the board
                     hanging_piece_penalty += (kp_material[piece] / 2);
+                }
+
+                // If this piece is actively under attack, whoever is defending it takes on a "load"
+                if (attackers > 0) {
+                    for(int dr = 0; dr < BOARD_H; dr++){
+                        for(int dc = 0; dc < BOARD_W; dc++){
+                            if(self_board[dr][dc] > 0 && const_cast<State*>(this)->attacks_square(dr, dc, this->player, r, c)){
+                                self_defense_load[dr][dc]++;
+                            }
+                        }
+                    }
                 }
                 
                 int attacked = const_cast<State*>(this)->count_attacked_pieces(r, c, this->player);
@@ -872,6 +879,16 @@ int State::evaluate(
                     // Reward us if the opponent leaves a piece hanging
                     hanging_piece_penalty -= (kp_material[piece] / 2);
                 }
+
+                if (attackers > 0) {
+                    for(int dr = 0; dr < BOARD_H; dr++){
+                        for(int dc = 0; dc < BOARD_W; dc++){
+                            if(oppn_board[dr][dc] > 0 && const_cast<State*>(this)->attacks_square(dr, dc, 1 - this->player, r, c)){
+                                oppn_defense_load[dr][dc]++;
+                            }
+                        }
+                    }
+                }
                 
                 int attacked = const_cast<State*>(this)->count_attacked_pieces(r, c, 1 - this->player);
                 
@@ -885,6 +902,19 @@ int State::evaluate(
                         oppn_fork_penalty += fork_vulnerability;
                     }
                 }
+            }
+        }
+    }
+
+    // --- Process the Overwhelmed Piece Penalty ---
+    for(int r = 0; r < BOARD_H; r++){
+        for(int c = 0; c < BOARD_W; c++){
+            if(self_defense_load[r][c] > 1){
+                // This piece is defending multiple attacked pieces. It is a massive liability.
+                self_overload_penalty += (self_defense_load[r][c] - 1) * 20;
+            }
+            if(oppn_defense_load[r][c] > 1){
+                oppn_overload_penalty += (oppn_defense_load[r][c] - 1) * 20;
             }
         }
     }
@@ -922,7 +952,7 @@ int State::evaluate(
         }
     }
 
-    bonus += self_fork_bonus - oppn_fork_penalty + pin_pressure_bonus;
+    bonus += self_fork_bonus - oppn_fork_penalty + pin_pressure_bonus - hanging_piece_penalty - self_overload_penalty + oppn_overload_penalty;
 
     return self_score - oppn_score + bonus;
 }

@@ -2,7 +2,7 @@
 #include <vector>
 #include <utility>
 #include <chrono>
-#include "quiescence.hpp"
+#include "Quiescence.hpp"
 #include "state.hpp"
 
 int QuiescenceSearch::eval_ctx(

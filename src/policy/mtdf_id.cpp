@@ -19,10 +19,11 @@ namespace {
     inline int piece_value(int piece) {
         switch (piece) {
             case 1: return 100;
-            case 2: return 300;
-            case 3: return 500;
-            case 4: return 900;
-            case 5: return 1000;
+            case 2: return 500;
+            case 3: return 300;
+            case 4: return 330;
+            case 5: return 900;
+            case 6: return 9000;
             default: return 0;
         }
     }
@@ -249,10 +250,10 @@ int MTDF_ID::eval_memory(
 
     history.push(hash);
 
-    static thread_local std::vector<std::array<Move, 2>> killers;
-    static thread_local std::vector<int> history_table;
-    static thread_local int hist_w = 0;
-    static thread_local int hist_h = 0;
+    static std::vector<std::array<Move, 2>> killers;
+    static std::vector<int> history_table;
+    static int hist_w = 0;
+    static int hist_h = 0;
 
     const int w = state->board_w();
     const int h = state->board_h();
@@ -345,7 +346,7 @@ int MTDF_ID::eval_memory(
 
             if (!is_tactical_move(state, action)) {
                 const int idx = quiet_history_index(state, action);
-                history_table[idx] += depth * depth;
+                history_table[idx] += depth;
                 if (history_table[idx] > 1000000000) {
                     for (int& v : history_table) v >>= 1;
                 }
